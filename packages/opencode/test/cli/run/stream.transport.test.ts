@@ -324,7 +324,7 @@ function textDelta(messageID: string, partID: string, delta: string, sessionID =
   }
 }
 
-function child(id: string): SessionChild {
+function child(id: string, input: Partial<SessionChild> = {}): SessionChild {
   return {
     id,
     slug: id,
@@ -336,6 +336,7 @@ function child(id: string): SessionChild {
       created: 1,
       updated: 1,
     },
+    ...input,
   }
 }
 
@@ -772,6 +773,126 @@ describe("run stream transport", () => {
       expect(state.details).toEqual({})
     } finally {
       src.close()
+      await transport.close()
+    }
+  })
+
+  test("bootstraps busy direct child sessions without task parts", async () => {
+    const src = eventFeed()
+    const ui = footer()
+    const transport = await createSessionTransport({
+      sdk: sdk({
+        stream: src.stream,
+        children: async () =>
+          ok([
+            child("child-1", {
+              title: "OpenSDD analysis (@opensdd-analysis subagent)",
+              agent: "opensdd-analysis",
+            }),
+          ]),
+        status: async () => ok({ "child-1": { type: "busy" } }),
+      }),
+      sessionID: "session-1",
+      thinking: true,
+      limits: () => ({}),
+      footer: ui.api,
+    })
+
+    try {
+      const state = await waitFor(() => {
+        const item = ui.events.findLast((event) => event.type === "stream.subagent")
+        return item?.type === "stream.subagent" && item.state.tabs.some((tab) => tab.sessionID === "child-1")
+          ? item.state
+          : undefined
+      })
+
+      expect(state.tabs).toEqual([
+        expect.objectContaining({
+          sessionID: "child-1",
+          partID: "child:child-1",
+          label: "Opensdd-Analysis",
+          status: "running",
+        }),
+      ])
+    } finally {
+      src.close()
+      await transport.close()
+    }
+  })
+
+  test("discovers direct child sessions from global session.created events", async () => {
+    const global = globalFeed()
+    const ui = footer()
+    const transport = await createSessionTransport({
+      sdk: sdk({
+        globalStream: global.stream,
+      }),
+      sessionID: "session-1",
+      thinking: true,
+      limits: () => ({}),
+      footer: ui.api,
+    })
+
+    try {
+      global.push(
+        globalEvent({
+          id: "evt-child-created",
+          type: "session.created",
+          properties: {
+            sessionID: "child-1",
+            info: child("child-1", {
+              parentID: "session-1",
+              title: "OpenSDD execution (@opensdd-execute subagent)",
+              agent: "opensdd-execute",
+            }),
+          },
+        }),
+      )
+
+      await waitFor(() => {
+        const item = ui.events.findLast((event) => event.type === "stream.subagent")
+        return item?.type === "stream.subagent" && item.state.tabs.some((tab) => tab.sessionID === "child-1")
+          ? item
+          : undefined
+      })
+
+      transport.selectSubagent("child-1")
+
+      global.push(
+        globalEvent({
+          id: "evt-child-message",
+          type: "message.updated",
+          properties: {
+            sessionID: "child-1",
+            info: assistantMessage({
+              sessionID: "child-1",
+              id: "msg-child-1",
+              parts: [],
+            }).info,
+          },
+        }),
+      )
+      global.push(globalEvent(textUpdated(textPart("txt-child-1", "msg-child-1", "direct child output", "child-1"))))
+
+      expect(
+        await waitFor(() => {
+          const item = ui.events.findLast((event) => event.type === "stream.subagent")
+          const detail = item?.type === "stream.subagent" ? item.state.details["child-1"] : undefined
+          return detail?.commits.some((commit) => commit.kind === "assistant" && commit.text === "direct child output")
+            ? detail
+            : undefined
+        }),
+      ).toEqual({
+        sessionID: "child-1",
+        commits: [
+          expect.objectContaining({
+            kind: "assistant",
+            text: "direct child output",
+          }),
+        ],
+      })
+    } finally {
+      global.close()
       await transport.close()
     }
   })

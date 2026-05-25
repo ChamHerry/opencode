@@ -182,6 +182,192 @@ function childMessage(input: {
 }
 
 describe("run subagent data", () => {
+  test("bootstraps busy child sessions without task parts as generic tabs", () => {
+    const data = createSubagentData()
+
+    expect(
+      bootstrapSubagentData({
+        data,
+        messages: [],
+        children: [
+          {
+            id: "child-1",
+            title: "OpenSDD analysis (@opensdd-analysis subagent)",
+            time: {
+              created: 1,
+              updated: 2,
+            },
+          },
+        ],
+        status: {
+          "child-1": { type: "busy" },
+        },
+        permissions: [],
+        questions: [],
+      }),
+    ).toBe(true)
+
+    expect(snapshotSubagentData(data).tabs).toEqual([
+      expect.objectContaining({
+        sessionID: "child-1",
+        partID: "child:child-1",
+        callID: "child:child-1",
+        label: "Opensdd-Analysis",
+        description: "OpenSDD analysis (@opensdd-analysis subagent)",
+        status: "running",
+        lastUpdatedAt: 2,
+      }),
+    ])
+  })
+
+  test("does not bootstrap idle child sessions without blockers", () => {
+    const data = createSubagentData()
+
+    expect(
+      bootstrapSubagentData({
+        data,
+        messages: [],
+        children: [{ id: "child-1", title: "Historical child" }],
+        status: {
+          "child-1": { type: "idle" },
+        },
+        permissions: [],
+        questions: [],
+      }),
+    ).toBe(false)
+
+    expect(snapshotSubagentData(data).tabs).toEqual([])
+  })
+
+  test("keeps task tabs ahead of generic child session tabs", () => {
+    const data = createSubagentData()
+
+    bootstrapSubagentData({
+      data,
+      messages: [taskMessage("child-1", "running")],
+      children: [{ id: "child-1", title: "Generic child" }],
+      status: {
+        "child-1": { type: "busy" },
+      },
+      permissions: [],
+      questions: [],
+    })
+
+    expect(snapshotSubagentData(data).tabs).toEqual([
+      expect.objectContaining({
+        sessionID: "child-1",
+        partID: "part-child-1",
+        label: "Explore",
+        description: "Scan reducer paths",
+        status: "running",
+      }),
+    ])
+  })
+
+  test("discovers direct child sessions from session.created events", () => {
+    const data = createSubagentData()
+
+    expect(
+      reduce(data, {
+        type: "session.created",
+        properties: {
+          sessionID: "child-1",
+          info: {
+            id: "child-1",
+            parentID: "parent-1",
+            title: "Direct child (@opensdd-execute subagent)",
+            time: {
+              created: 1,
+            },
+          },
+        },
+      }),
+    ).toBe(true)
+
+    expect(snapshotSubagentData(data).tabs).toEqual([
+      expect.objectContaining({
+        sessionID: "child-1",
+        partID: "child:child-1",
+        label: "Opensdd-Execute",
+        status: "running",
+      }),
+    ])
+  })
+
+  test("applies child events after generic discovery", () => {
+    const data = createSubagentData()
+
+    reduce(data, {
+      type: "session.created",
+      properties: {
+        sessionID: "child-1",
+        info: {
+          id: "child-1",
+          parentID: "parent-1",
+          title: "Direct child (@opensdd-execute subagent)",
+        },
+      },
+    })
+    reduce(data, {
+      type: "message.updated",
+      properties: {
+        sessionID: "child-1",
+        info: {
+          id: "msg-assistant-1",
+          role: "assistant",
+        },
+      },
+    })
+    reduce(data, {
+      type: "message.part.updated",
+      properties: {
+        part: {
+          id: "txt-1",
+          messageID: "msg-assistant-1",
+          sessionID: "child-1",
+          type: "text",
+          text: "generic child output",
+        },
+      },
+    })
+
+    expect(visible(snapshotSubagentData(data).details["child-1"]?.commits ?? [])).toEqual(["generic child output"])
+  })
+
+  test("marks generic child tabs completed from idle status", () => {
+    const data = createSubagentData()
+
+    reduce(data, {
+      type: "session.created",
+      properties: {
+        sessionID: "child-1",
+        info: {
+          id: "child-1",
+          parentID: "parent-1",
+          title: "Direct child",
+        },
+      },
+    })
+
+    expect(
+      reduce(data, {
+        type: "session.status",
+        properties: {
+          sessionID: "child-1",
+          status: {
+            type: "idle",
+          },
+        },
+      }),
+    ).toBe(true)
+    expect(snapshotSubagentData(data).tabs).toEqual([
+      expect.objectContaining({ sessionID: "child-1", status: "completed" }),
+    ])
+
+    expect(clearFinishedSubagents(data)).toBe(true)
+    expect(snapshotSubagentData(data).tabs).toEqual([])
+  })
+
   test("bootstraps tabs and child blockers from parent task parts", () => {
     const data = createSubagentData()
 

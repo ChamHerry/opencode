@@ -1426,6 +1426,20 @@ function AssistantMessage(props: { message: AssistantMessage; parts: Part[]; las
     if (!user || !user.time) return 0
     return props.message.time.completed - user.time.created
   })
+  const showSubagentHint = createMemo(() => {
+    if (props.parts.some((x) => x.type === "tool" && x.tool === "task")) return true
+    if (!props.last) return false
+    if (sync.session.get(props.message.sessionID)?.parentID) return false
+    return sync.data.session.some((x) => x.parentID === props.message.sessionID)
+  })
+  const directSubagents = createMemo(() => {
+    if (props.parts.some((x) => x.type === "tool" && x.tool === "task")) return []
+    if (!props.last) return []
+    if (sync.session.get(props.message.sessionID)?.parentID) return []
+    return sync.data.session
+      .filter((x) => x.parentID === props.message.sessionID)
+      .toSorted((a, b) => a.time.created - b.time.created)
+  })
 
   const childShortcut = useCommandShortcut("session.child.first")
 
@@ -1446,7 +1460,8 @@ function AssistantMessage(props: { message: AssistantMessage; parts: Part[]; las
           )
         }}
       </For>
-      <Show when={props.parts.some((x) => x.type === "tool" && x.tool === "task")}>
+      <DirectSubagentSessions sessions={directSubagents()} />
+      <Show when={showSubagentHint()}>
         <box paddingTop={1} paddingLeft={3}>
           <text fg={theme.text}>
             {childShortcut()}
@@ -1495,6 +1510,63 @@ function AssistantMessage(props: { message: AssistantMessage; parts: Part[]; las
         </Match>
       </Switch>
     </>
+  )
+}
+
+function DirectSubagentSessions(props: { sessions: ReturnType<typeof useSync>["data"]["session"] }) {
+  const { theme } = useTheme()
+  const sync = useSync()
+  const route = useRoute()
+  const renderer = useRenderer()
+  const [hover, setHover] = createSignal<string | undefined>()
+
+  return (
+    <For each={props.sessions}>
+      {(session) => {
+        const status = createMemo(() => sync.data.session_status[session.id])
+        const running = createMemo(() => status()?.type === "busy")
+        const errored = createMemo(() => status()?.type === "retry")
+        const agent = createMemo(() => {
+          const match = session.title.match(/\(@([^)]+) subagent\)/)
+          return session.agent ?? match?.[1] ?? "general"
+        })
+        const description = createMemo(
+          () => session.title.replace(/\s*\(@([^)]+) subagent\)\s*$/, "").trim() || session.title,
+        )
+        const content = createMemo(() => {
+          const lines = [`${Locale.titlecase(agent())} Task — ${description()}`]
+          const current = status()
+          if (running()) lines.push("↳ Running")
+          if (current?.type === "retry") lines.push(`↳ ${current.message}`)
+          return lines.join("\n")
+        })
+
+        return (
+          <box
+            marginTop={1}
+            paddingLeft={3}
+            onMouseOver={() => setHover(session.id)}
+            onMouseOut={() => setHover(undefined)}
+            onMouseUp={() => {
+              if (renderer.getSelection()?.getSelectedText()) return
+              route.navigate({ type: "session", sessionID: session.id })
+            }}
+          >
+            <Show
+              when={running()}
+              fallback={
+                <text paddingLeft={3} fg={hover() === session.id ? theme.text : theme.textMuted}>
+                  <span style={{ fg: errored() ? theme.error : theme.textMuted }}>{errored() ? "✗" : "✓"}</span>{" "}
+                  {content()}
+                </text>
+              }
+            >
+              <Spinner color={hover() === session.id ? theme.text : theme.textMuted}>{content()}</Spinner>
+            </Show>
+          </box>
+        )
+      }}
+    </For>
   )
 }
 

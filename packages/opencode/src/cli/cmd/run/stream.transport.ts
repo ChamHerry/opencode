@@ -134,6 +134,8 @@ function sid(event: Event): string | undefined {
   }
 
   if (
+    event.type === "session.created" ||
+    event.type === "session.updated" ||
     event.type === "session.next.shell.started" ||
     event.type === "session.next.shell.ended" ||
     event.type === "permission.asked" ||
@@ -444,7 +446,19 @@ function createLayer(input: StreamInput) {
         const replayedParts = new Set<string>()
         const recovering = new Set<string>()
         const tracked = (sessionID: string | undefined) =>
-          sessionID === input.sessionID || (!!sessionID && state.subagent.tabs.has(sessionID))
+          sessionID === input.sessionID ||
+          (!!sessionID && (state.subagent.tabs.has(sessionID) || state.subagent.children.has(sessionID)))
+        const trackedEvent = (event: Event) => {
+          if (tracked(sid(event))) {
+            return true
+          }
+
+          if (event.type === "session.created" || event.type === "session.updated") {
+            return event.properties.info.parentID === input.sessionID
+          }
+
+          return false
+        }
         const currentSubagentState = () => {
           if (state.selectedSubagent && !state.subagent.tabs.has(state.selectedSubagent)) {
             state.selectedSubagent = undefined
@@ -627,7 +641,7 @@ function createLayer(input: StreamInput) {
         })
 
         const bootstrap = Effect.fn("RunStreamTransport.bootstrap")(function* () {
-          const [messagesList, children, permissions, questions] = yield* Effect.all(
+          const [messagesList, children, status, permissions, questions] = yield* Effect.all(
             [
               messages(
                 input.sessionID,
@@ -644,6 +658,10 @@ function createLayer(input: StreamInput) {
               ).pipe(
                 Effect.map((item) => item.data ?? []),
                 Effect.orElseSucceed(() => []),
+              ),
+              Effect.promise(() => input.sdk.session.status()).pipe(
+                Effect.map((item) => item.data ?? {}),
+                Effect.orElseSucceed(() => ({})),
               ),
               Effect.promise(() => input.sdk.permission.list()).pipe(
                 Effect.map((item) => item.data ?? []),
@@ -709,6 +727,7 @@ function createLayer(input: StreamInput) {
             data: state.subagent,
             messages: messagesList,
             children,
+            status,
             permissions,
             questions,
           })
@@ -901,7 +920,7 @@ function createLayer(input: StreamInput) {
             const next: Event[] = []
             let changed = false
             for (const event of pending) {
-              if (!tracked(sid(event))) {
+              if (!trackedEvent(event)) {
                 next.push(event)
                 continue
               }
@@ -951,7 +970,7 @@ function createLayer(input: StreamInput) {
                   return
                 }
 
-                if (!tracked(sessionID)) {
+                if (!trackedEvent(event)) {
                   if (sessionID) {
                     input.trace?.write("recv.event", event)
                     buffered.push(event)

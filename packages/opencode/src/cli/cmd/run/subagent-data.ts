@@ -1,4 +1,12 @@
-import type { Event, Message, Part, PermissionRequest, QuestionRequest, ToolPart } from "@opencode-ai/sdk/v2"
+import type {
+  Event,
+  Message,
+  Part,
+  PermissionRequest,
+  QuestionRequest,
+  SessionStatus,
+  ToolPart,
+} from "@opencode-ai/sdk/v2"
 import * as Locale from "@/util/locale"
 import {
   bootstrapSessionData,
@@ -37,15 +45,28 @@ type DetailState = {
   frames: Frame[]
 }
 
+type ChildSessionInfo = {
+  id: string
+  title?: string
+  parentID?: string
+  agent?: string
+  time?: {
+    created?: number
+    updated?: number
+  }
+}
+
 export type SubagentData = {
   tabs: Map<string, FooterSubagentTab>
   details: Map<string, DetailState>
+  children: Map<string, ChildSessionInfo>
 }
 
 export type BootstrapSubagentInput = {
   data: SubagentData
   messages: SessionMessage[]
-  children: Array<{ id: string; title?: string }>
+  children: ChildSessionInfo[]
+  status?: Record<string, SessionStatus>
   permissions: PermissionRequest[]
   questions: QuestionRequest[]
 }
@@ -311,6 +332,88 @@ function taskTab(part: ToolPart, sessionID: string): FooterSubagentTab {
 
 function taskSessionID(part: ToolPart) {
   return text(metadata(part, "sessionId")) ?? text(metadata(part, "sessionID"))
+}
+
+function childSessionAgent(info: ChildSessionInfo) {
+  return text(info.agent) ?? text(info.title?.match(/\(@([^)]+) subagent\)/)?.[1])
+}
+
+function childSessionLabel(info: ChildSessionInfo) {
+  const agent = childSessionAgent(info)
+  if (agent) {
+    return Locale.titlecase(agent)
+  }
+
+  return "Child Session"
+}
+
+function childDescription(info: ChildSessionInfo) {
+  return text(info.title) ?? "Direct child session"
+}
+
+function childStatus(status: SessionStatus | undefined, current: FooterSubagentTab | undefined) {
+  if (!status) {
+    return current?.status ?? "completed"
+  }
+
+  if (status.type === "busy") {
+    return "running" as const
+  }
+
+  if (status.type === "retry") {
+    return "error" as const
+  }
+
+  return "completed" as const
+}
+
+function childUpdatedAt(info: ChildSessionInfo, current: FooterSubagentTab | undefined) {
+  return info.time?.updated ?? info.time?.created ?? current?.lastUpdatedAt ?? Date.now()
+}
+
+function rememberChild(data: SubagentData, info: ChildSessionInfo) {
+  const current = data.children.get(info.id)
+  const next = current
+    ? {
+        ...current,
+        ...info,
+        time: {
+          ...current.time,
+          ...info.time,
+        },
+      }
+    : info
+
+  data.children.set(next.id, next)
+  return next
+}
+
+function ensureChildTab(data: SubagentData, info: ChildSessionInfo, status?: SessionStatus) {
+  const child = rememberChild(data, info)
+  const current = data.tabs.get(child.id)
+  if (current && !current.partID.startsWith("child:")) {
+    ensureDetail(data, child.id)
+    return false
+  }
+
+  const next = {
+    sessionID: child.id,
+    partID: `child:${child.id}`,
+    callID: `child:${child.id}`,
+    label: childSessionLabel(child),
+    description: childDescription(child),
+    status: childStatus(status, current),
+    title: child.title,
+    lastUpdatedAt: childUpdatedAt(child, current),
+  }
+  if (sameSubagentTab(current, next)) {
+    ensureDetail(data, child.id)
+    return false
+  }
+
+  data.tabs.set(child.id, next)
+  ensureDetail(data, child.id)
+  return true
 }
 
 function syncTaskTab(data: SubagentData, part: ToolPart, children?: Set<string>) {
@@ -599,7 +702,7 @@ function bootstrapChildMessages(input: {
 }
 
 function knownSession(data: SubagentData, sessionID: string) {
-  return data.tabs.has(sessionID)
+  return data.tabs.has(sessionID) || data.children.has(sessionID)
 }
 
 export function listSubagentPermissions(data: SubagentData) {
@@ -614,6 +717,7 @@ export function createSubagentData(): SubagentData {
   return {
     tabs: new Map(),
     details: new Map(),
+    children: new Map(),
   }
 }
 
@@ -679,6 +783,22 @@ export function bootstrapSubagentData(input: BootstrapSubagentInput) {
 
       changed = syncTaskTab(input.data, part, children) || changed
     }
+  }
+
+  for (const item of input.children) {
+    const hasBlocker =
+      input.permissions.some((request) => request.sessionID === item.id) ||
+      input.questions.some((request) => request.sessionID === item.id)
+    const status = input.status?.[item.id]
+    if (!status && !hasBlocker && !input.data.tabs.has(item.id)) {
+      continue
+    }
+
+    if (status?.type === "idle" && !hasBlocker && !input.data.tabs.has(item.id)) {
+      continue
+    }
+
+    changed = ensureChildTab(input.data, item, hasBlocker ? { type: "busy" } : status) || changed
   }
 
   for (const item of input.permissions) {
@@ -759,6 +879,7 @@ export function clearFinishedSubagents(data: SubagentData) {
 
     data.tabs.delete(sessionID)
     data.details.delete(sessionID)
+    data.children.delete(sessionID)
     changed = true
   }
 
@@ -773,6 +894,22 @@ export function reduceSubagentData(input: {
   limits: Record<string, number>
 }) {
   const event = input.event
+
+  if (event.type === "session.created") {
+    if (event.properties.info.parentID !== input.sessionID) {
+      return false
+    }
+
+    return ensureChildTab(input.data, event.properties.info, { type: "busy" })
+  }
+
+  if (event.type === "session.updated") {
+    if (event.properties.info.parentID !== input.sessionID && !knownSession(input.data, event.properties.info.id)) {
+      return false
+    }
+
+    return ensureChildTab(input.data, event.properties.info)
+  }
 
   if (event.type === "message.part.updated") {
     const part = event.properties.part
@@ -806,19 +943,23 @@ export function reduceSubagentData(input: {
 
   const detail = ensureDetail(input.data, sessionID)
   if (event.type === "session.status") {
-    if (event.properties.status.type !== "retry") {
-      return false
+    const info = input.data.children.get(sessionID)
+    const tabChanged = info ? ensureChildTab(input.data, info, event.properties.status) : false
+    if (event.properties.status.type === "retry") {
+      return (
+        appendCommits(detail, [
+          {
+            kind: "error",
+            text: event.properties.status.message,
+            phase: "start",
+            source: "system",
+            messageID: `retry:${event.properties.status.attempt}`,
+          },
+        ]) || tabChanged
+      )
     }
 
-    return appendCommits(detail, [
-      {
-        kind: "error",
-        text: event.properties.status.message,
-        phase: "start",
-        source: "system",
-        messageID: `retry:${event.properties.status.attempt}`,
-      },
-    ])
+    return tabChanged
   }
 
   if (event.type === "session.error" && event.properties.error) {
