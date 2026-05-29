@@ -30,3 +30,7 @@ UPCOMING_CHANGELOG.md
 logs/
 *.bun-build
 tsconfig.tsbuildinfo
+.claude/
+.opensdd/
+.spec-workflow/
+CLAUDE.md
